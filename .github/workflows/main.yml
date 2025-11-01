@@ -1,17 +1,17 @@
-name: RDP + NVIDIA GPU + Tailscale
+name: RDP with Tailscale & NVIDIA
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp-gpu:
-    runs-on: [self-hosted, windows, gpu]
-    timeout-minutes: 180
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 180  # Limitar a 3 horas
 
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable NLA
+          # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -19,89 +19,69 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Firewall for RDP
+          # Configure firewall for RDP
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          # Restart RDP service
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
+          $chars = @{
+              Upper = [char[]](65..90)
+              Lower = [char[]](97..122)
+              Number = [char[]](48..57)
               Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
+          $pw = ($chars.Upper | Get-Random -Count 4) + 
+                ($chars.Lower | Get-Random -Count 4) + 
+                ($chars.Number | Get-Random -Count 4) + 
+                ($chars.Special | Get-Random -Count 4)
+          $pw = -join ($pw | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $pw -AsPlainText -Force
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
-          # Mask password in GitHub logs
-          echo "::add-mask::$password"
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-
-      - name: Install NVIDIA GPU Drivers
-        run: |
-          $nvidiaUrl = "https://us.download.nvidia.com/Windows/531.41/531.41-desktop-win10-win11-64bit-international-dch-whql.exe"
-          $installer = "$env:TEMP\nvidia-driver.exe"
-          Invoke-WebRequest -Uri $nvidiaUrl -OutFile $installer
-          Start-Process -FilePath $installer -ArgumentList "-s" -Wait
-          Remove-Item $installer -Force
-
-      - name: Install CUDA Toolkit
-        run: |
-          $cudaUrl = "https://developer.download.nvidia.com/compute/cuda/12.2.1/local_installers/cuda_12.2.1_532.03_windows_network.exe"
-          $installer = "$env:TEMP\cuda-installer.exe"
-          Invoke-WebRequest -Uri $cudaUrl -OutFile $installer
-          Start-Process -FilePath $installer -ArgumentList "-s" -Wait
-          Remove-Item $installer -Force
+          echo "::add-mask::$pw"
+          echo "RDP_CREDS=User: RDP | Password: $pw" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installer
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_EPHEMERAL_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          for ($i=0; $i -lt 10 -and -not $tsIP; $i++) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+              Start-Sleep 5
           }
-
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $result.TcpTestSucceeded) { Write-Error "RDP connection failed"; exit 1 }
+          Write-Host "RDP connectivity successful!"
+
+      - name: Detect NVIDIA GPU
+        run: |
+          $gpu = Get-WmiObject Win32_VideoController | Where-Object {$_.Name -like "*NVIDIA*"}
+          if ($gpu) {
+              Write-Host "NVIDIA GPU detected: $($gpu.Name)"
+              Write-Host "You can install CUDA or DirectML here if needed."
+          } else {
+              Write-Host "No NVIDIA GPU detected. Skipping GPU setup."
           }
-          Write-Host "TCP connectivity successful!"
 
       - name: Maintain Connection
         run: |
@@ -112,6 +92,6 @@ jobs:
           Write-Host "==================`n"
 
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active with NVIDIA GPU - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+              Write-Host "[$(Get-Date)] RDP Active - Ctrl+C to terminate workflow"
+              Start-Sleep 300
           }
