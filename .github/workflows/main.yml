@@ -6,7 +6,7 @@ on:
 jobs:
   secure-rdp:
     runs-on: [self-hosted, windows, 120core] # Self-hosted runner con 120 cores
-    timeout-minutes: 180 # Limitar a 3 horas para no dejarlo corriendo indefinidamente
+    timeout-minutes: 180 # Limitar a 3 horas
 
     steps:
       - name: Configure Core RDP Settings
@@ -67,7 +67,7 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          # Usar auth key efímera para mayor seguridad
+          # Usar auth key efímera
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_EPHEMERAL_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
 
           # Esperar IP de Tailscale
