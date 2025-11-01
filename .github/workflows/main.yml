@@ -6,7 +6,7 @@ on:
 jobs:
   rdp-vps-free:
     runs-on: windows-latest  # Funciona en hosted runner o self-hosted
-    timeout-minutes: 1440    # 24 horas para mantener la sesión activa
+    timeout-minutes: 1440    # 24 horas para el job
 
     steps:
       - name: Configure RDP and Firewall
@@ -78,15 +78,10 @@ jobs:
               Write-Host "No se detectó GPU NVIDIA"
           }
 
-      - name: Keep RDP Active
+      - name: Show RDP Info
         run: |
           Write-Host "`n=== RDP LISTO ==="
           Write-Host "Usuario: RDP"
           Write-Host "Password: P@ssw0rd123!"
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "==================`n"
-
-          while ($true) {
-              Write-Host "[$(Get-Date)] VPS/RDP activo - Ctrl+C para terminar workflow"
-              Start-Sleep -Seconds 300
-          )
