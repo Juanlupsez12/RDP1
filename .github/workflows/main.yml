@@ -6,11 +6,12 @@ on:
 jobs:
   secure-rdp:
     runs-on: self-hosted
-    timeout-minutes: 480  # Hasta 8 horas para pruebas largas
+    timeout-minutes: 480  # Hasta 8 horas
 
     steps:
       - name: Configure Core RDP Settings
         run: |
+          # Habilitar RDP y configurar firewall
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -25,6 +26,7 @@ jobs:
 
       - name: Create RDP User with Secure Password
         run: |
+          # Mantener exactamente tu bloque original
           Add-Type -AssemblyName System.Security
           $charSet = @{
               Upper   = [char[]](65..90)
@@ -44,6 +46,11 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
@@ -57,9 +64,11 @@ jobs:
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           $tsIP = $null
-          for ($i=0; $i -lt 10 -and -not $tsIP; $i++) {
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep 5
+              $retries++
           }
           if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
@@ -76,14 +85,14 @@ jobs:
           $gpu = Get-WmiObject Win32_VideoController | Where-Object { $_.Name -like "*NVIDIA*" }
           if ($gpu) {
               Write-Host "NVIDIA GPU detected: $($gpu.Name)"
-              # Instalar drivers NVIDIA GeForce automáticamente (ejemplo)
+              # Instalar drivers NVIDIA GeForce automáticamente
               $driverUrl = "https://us.download.nvidia.com/Windows/531.68/531.68-desktop-win10-win11-64bit-international-dch-whql.exe"
               $installer = "$env:TEMP\nvidia_driver.exe"
               Invoke-WebRequest -Uri $driverUrl -OutFile $installer
               Start-Process -FilePath $installer -ArgumentList "-s" -Wait
               Remove-Item $installer -Force
 
-              # Opcional: instalar CUDA Toolkit
+              # Instalar CUDA Toolkit opcionalmente
               $cudaUrl = "https://developer.download.nvidia.com/compute/cuda/12.2.0/local_installers/cuda_12.2.0_windows.exe"
               $cudaInstaller = "$env:TEMP\cuda_installer.exe"
               Invoke-WebRequest -Uri $cudaUrl -OutFile $cudaInstaller
