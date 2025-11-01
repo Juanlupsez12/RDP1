@@ -1,4 +1,4 @@
-name: RDP with Tailscale & NVIDIA
+name: RDP with Tailscale & NVIDIA (User Juan)
 
 on:
   workflow_dispatch:
@@ -25,27 +25,26 @@ jobs:
 
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP User "Juan"
         run: |
-          Add-Type -AssemblyName System.Security
-          $chars = @{
-              Upper = [char[]](65..90)
-              Lower = [char[]](97..122)
-              Number = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-          }
-          $pw = ($chars.Upper | Get-Random -Count 4) + 
-                ($chars.Lower | Get-Random -Count 4) + 
-                ($chars.Number | Get-Random -Count 4) + 
-                ($chars.Special | Get-Random -Count 4)
-          $pw = -join ($pw | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $pw -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          $username = "Juan"
+          $password = "Juan"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          echo "::add-mask::$pw"
-          echo "RDP_CREDS=User: RDP | Password: $pw" >> $env:GITHUB_ENV
+          # Crear usuario local si no existe
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+              Write-Host "User $username created."
+          } else {
+              Write-Host "User $username already exists."
+          }
+
+          # Agregar a grupos
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+
+          # Guardar credenciales para usar después
+          echo "RDP_CREDS=User: $username | Password: $password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
@@ -78,7 +77,7 @@ jobs:
           $gpu = Get-WmiObject Win32_VideoController | Where-Object {$_.Name -like "*NVIDIA*"}
           if ($gpu) {
               Write-Host "NVIDIA GPU detected: $($gpu.Name)"
-              Write-Host "You can install CUDA or DirectML here if needed."
+              Write-Host "Optionally install CUDA or DirectML here."
           } else {
               Write-Host "No NVIDIA GPU detected. Skipping GPU setup."
           }
@@ -87,8 +86,8 @@ jobs:
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Username: Juan"
+          Write-Host "Password: Juan"
           Write-Host "==================`n"
 
           while ($true) {
