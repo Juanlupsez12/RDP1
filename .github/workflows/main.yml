@@ -1,4 +1,4 @@
-name: RDP with Tailscale & NVIDIA (User Juan)
+name: RDP with Tailscale & NVIDIA (Juan static password)
 
 on:
   workflow_dispatch:
@@ -6,12 +6,13 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 180  # Limitar a 3 horas
+    # Ajusta este tiempo si quieres más/menos
+    timeout-minutes: 120  # 2 horas por defecto
 
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop
+          # Habilitar Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -19,32 +20,42 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Configure firewall for RDP
+          # Re-crear regla de firewall para RDP (puedes restringir por IP/Interfaz si quieres)
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User "Juan"
+      - name: Create local user Juan (password = Juan) and mask password
         run: |
+          # WARNING: weak password by request
           $username = "Juan"
-          $password = "Juan"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $plainPassword = "Juan"
 
-          # Crear usuario local si no existe
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
-              Write-Host "User $username created."
-          } else {
-              Write-Host "User $username already exists."
+          # Enmascarar la contraseña en los logs de Actions
+          Write-Host "::add-mask::$plainPassword"
+
+          # Crear o reemplazar usuario local
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Write-Host "Usuario $username ya existe — eliminando antes de crear de nuevo."
+              Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
           }
 
-          # Agregar a grupos
-          Add-LocalGroupMember -Group "Administrators" -Member $username
+          $securePass = ConvertTo-SecureString $plainPassword -AsPlainText -Force
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+
+          # Añadir al grupo Remote Desktop Users (no lo añadimos a Administrators para reducir riesgo)
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
 
-          # Guardar credenciales para usar después
-          echo "RDP_CREDS=User: $username | Password: $password" >> $env:GITHUB_ENV
+          # Exportar credenciales para uso en pasos siguientes (variable de entorno)
+          echo "RDP_USER=Juan" >> $env:GITHUB_ENV
+          echo "RDP_PASS=Juan" >> $env:GITHUB_ENV
+          echo "RDP_CREDS=User: Juan | Password: Juan" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name $username)) {
+              Write-Error "No se pudo crear el usuario Juan"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
@@ -55,42 +66,70 @@ jobs:
           Remove-Item $installer
 
       - name: Establish Tailscale Connection
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # Preferiblemente usa una auth key efímera en los secrets
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+
           $tsIP = $null
-          for ($i=0; $i -lt 10 -and -not $tsIP; $i++) {
+          for ($i=0; $i -lt 12 -and -not $tsIP; $i++) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep 5
+              Start-Sleep -Seconds 5
           }
-          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP no fue asignada. Saliendo."
+              exit 1
+          }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $result.TcpTestSucceeded) { Write-Error "RDP connection failed"; exit 1 }
-          Write-Host "RDP connectivity successful!"
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $result.TcpTestSucceeded) {
+              Write-Error "Conexión TCP al puerto 3389 falló. Revisa que Tailscale y RDP estén activos."
+              exit 1
+          }
+          Write-Host "Conectividad RDP verificada."
 
-      - name: Detect NVIDIA GPU
+      - name: Detect NVIDIA GPU (condicional)
         run: |
           $gpu = Get-WmiObject Win32_VideoController | Where-Object {$_.Name -like "*NVIDIA*"}
           if ($gpu) {
-              Write-Host "NVIDIA GPU detected: $($gpu.Name)"
-              Write-Host "Optionally install CUDA or DirectML here."
+              Write-Host "GPU NVIDIA detectada: $($gpu.Name)"
+              # Aquí podrías instalar drivers/CUDA si estás en un self-hosted runner con GPU real.
+              # Ejemplo (comentado) de instalación automática:
+              # Start-Process -FilePath "ruta_al_instalador_cuda.exe" -ArgumentList "/silent" -Wait
           } else {
-              Write-Host "No NVIDIA GPU detected. Skipping GPU setup."
+              Write-Host "No se detectó GPU NVIDIA. Saltando configuración GPU."
           }
 
-      - name: Maintain Connection
+      - name: Show connection details (safe)
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: Juan"
-          Write-Host "Password: Juan"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: (masked)"
           Write-Host "==================`n"
 
+      - name: Maintain Connection (will run until canceled or timeout)
+        run: |
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Ctrl+C to terminate workflow"
-              Start-Sleep 300
+              Write-Host "[$(Get-Date)] RDP Active - Ctrl+C para terminar el workflow (o el timeout lo hará automáticamente)."
+              Start-Sleep -Seconds 300
+          )
+
+      - name: Cleanup (remove user Juan and tailscale down) 
+        if: ${{ always() }}
+        run: |
+          # Intentar bajar tailscale y eliminar usuario Juan en la finalización
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" down || Write-Host "tailscale down falló o no estuvo activo"
+          }
+          if (Get-LocalUser -Name "Juan" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "Juan" -ErrorAction SilentlyContinue
+              Write-Host "Usuario Juan eliminado."
+          } else {
+              Write-Host "Usuario Juan no existía en el momento de cleanup."
           }
