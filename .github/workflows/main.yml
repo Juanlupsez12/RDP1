@@ -1,82 +1,118 @@
-name: RDP-HighCore-AWS
+name: RDP with NVIDIA GPU
 
 on:
   workflow_dispatch:
 
 jobs:
-  create-highcore-vm:
-    runs-on: ubuntu-latest
-    timeout-minutes: 240
+  secure-rdp-gpu:
+    runs-on: self-hosted
+    timeout-minutes: 3600
 
     steps:
-      - name: Set up AWS CLI
+      - name: Configure Core RDP Settings
         run: |
-          sudo apt-get update
-          sudo apt-get install -y awscli jq
+          # Enable Remote Desktop and disable NLA
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          # Configure firewall for RDP
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-      - name: Launch EC2 Windows Instance
-        id: launch
+          # Restart RDP service
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
         run: |
-          INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id ami-0c02fb55956c7d316 \
-            --instance-type c5.24xlarge \
-            --key-name ${{ secrets.AWS_KEY_NAME }} \
-            --security-group-ids ${{ secrets.AWS_SECURITY_GROUP }} \
-            --subnet-id ${{ secrets.AWS_SUBNET_ID }} \
-            --associate-public-ip-address \
-            --query 'Instances[0].InstanceId' --output text)
-          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-      - name: Wait for EC2 instance ready
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          # Mask password in GitHub logs
+          echo "::add-mask::$password"
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Install NVIDIA GPU Drivers
         run: |
-          echo "Waiting for instance to be ready..."
-          aws ec2 wait instance-status-ok --instance-ids $INSTANCE_ID
-          PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID \
-                      --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
-          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
-          echo "Instance launched at IP: $PUBLIC_IP"
+          $nvidiaUrl = "https://us.download.nvidia.com/Windows/531.41/531.41-desktop-win10-win11-64bit-international-dch-whql.exe"
+          $installer = "$env:TEMP\nvidia-driver.exe"
+          Invoke-WebRequest -Uri $nvidiaUrl -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "-s" -Wait
+          Remove-Item $installer -Force
 
-      - name: Configure Windows (RDP + Tailscale + User)
-        id: configure
+      - name: Install CUDA Toolkit
         run: |
-          # Genera contraseña segura
-          PASSWORD=$(openssl rand -base64 20)
-          echo "::add-mask::$PASSWORD"
-          echo "RDP_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+          $cudaUrl = "https://developer.download.nvidia.com/compute/cuda/12.2.1/local_installers/cuda_12.2.1_532.03_windows_network.exe"
+          $installer = "$env:TEMP\cuda-installer.exe"
+          Invoke-WebRequest -Uri $cudaUrl -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "-s" -Wait
+          Remove-Item $installer -Force
 
-          # Script de PowerShell para configurar Windows
-          CONFIG_SCRIPT="Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force;
-          Set-ItemProperty -Path 'HKLM:\\System\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force;
-          netsh advfirewall firewall add rule name='RDP-Tailscale' dir=in action=allow protocol=TCP localport=3389;
-          net user RDP $PASSWORD /add;
-          net localgroup Administrators RDP /add;
-          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi' -OutFile 'C:\\tailscale.msi';
-          Start-Process msiexec.exe -ArgumentList '/i C:\\tailscale.msi /quiet /norestart' -Wait;
-          & 'C:\\Program Files\\Tailscale\\tailscale.exe' up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}"
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          # Ejecuta el script via AWS SSM
-          COMMAND_ID=$(aws ssm send-command \
-            --targets "Key=instanceIds,Values=$INSTANCE_ID" \
-            --document-name "AWS-RunPowerShellScript" \
-            --comment "Configure RDP + Tailscale + User" \
-            --parameters "commands=$CONFIG_SCRIPT" \
-            --query "Command.CommandId" --output text)
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_EPHEMERAL_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # Espera que el comando termine
-          aws ssm wait command-executed --command-id $COMMAND_ID --instance-id $INSTANCE_ID
+          # Wait for Tailscale IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
 
-      - name: Output RDP Information
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
         run: |
-          echo "===== RDP ACCESS ====="
-          echo "IP Address: ${{ env.PUBLIC_IP }}"
-          echo "Username: RDP"
-          echo "Password: ${{ env.RDP_PASSWORD }}"
-          echo "Tailscale is active for private access"
-          echo "======================"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active with NVIDIA GPU - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
