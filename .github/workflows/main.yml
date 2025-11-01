@@ -1,12 +1,12 @@
-name: RDP with NVIDIA GPU
+name: RDP + NVIDIA GPU + Tailscale
 
 on:
   workflow_dispatch:
 
 jobs:
   secure-rdp-gpu:
-    runs-on: self-hosted
-    timeout-minutes: 3600
+    runs-on: [self-hosted, windows, gpu]
+    timeout-minutes: 180
 
     steps:
       - name: Configure Core RDP Settings
@@ -19,7 +19,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Configure firewall for RDP
+          # Firewall for RDP
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
@@ -79,7 +79,6 @@ jobs:
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_EPHEMERAL_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # Wait for Tailscale IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
