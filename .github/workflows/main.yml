@@ -1,87 +1,113 @@
-name: RDP + VPS Free Ready
+name: VPS Windows RDP Setup
 
 on:
   workflow_dispatch:
 
 jobs:
-  rdp-vps-free:
-    runs-on: windows-latest  # Funciona en hosted runner o self-hosted
-    timeout-minutes: 1440    # 24 horas para el job
+  windows-vps:
+    runs-on: ubuntu-latest   # usamos Ubuntu runner para manejar OCI CLI
+    timeout-minutes: 180
 
     steps:
-      - name: Configure RDP and Firewall
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install OCI CLI
         run: |
-          Write-Host "=== Configurando RDP ==="
-          # Habilitar Remote Desktop
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+          curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh | bash -s -- -y
+          echo "$HOME/bin" >> $GITHUB_PATH
 
-          # Configurar firewall para RDP
-          netsh advfirewall firewall delete rule name="RDP-Rule" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Rule" dir=in action=allow protocol=TCP localport=3389
-
-          # Reiniciar servicio RDP
-          Restart-Service -Name TermService -Force
-          Write-Host "RDP habilitado y firewall configurado"
-
-      - name: Create RDP User
+      - name: Configure OCI CLI
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_KEY_FILE: ${{ secrets.OCI_PRIVATE_KEY }}
         run: |
-          $Username = "RDP"
-          $PasswordPlain = "P@ssw0rd123!"
-          $SecurePass = ConvertTo-SecureString $PasswordPlain -AsPlainText -Force
+          oci setup config --user $OCI_USER_OCID \
+                           --tenancy $OCI_TENANCY_OCID \
+                           --region $OCI_REGION \
+                           --key-file $OCI_KEY_FILE \
+                           --fingerprint ${{ secrets.OCI_FINGERPRINT }} \
+                           --overwrite
 
-          if (-not (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name $Username -Password $SecurePass -AccountNeverExpires
-              Add-LocalGroupMember -Group "Administrators" -Member $Username
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username
-              Write-Host "Usuario RDP creado: $Username / $PasswordPlain"
-          } else {
-              Write-Host "Usuario RDP ya existe"
-          }
-
-      - name: Install Tailscale
+      - name: Create Windows VM
+        id: create_vm
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-          Write-Host "Tailscale instalado"
+          echo "Creating Windows VM..."
+          VM_OCID=$(oci compute instance launch \
+            --availability-domain "${{ secrets.OCI_AD }}" \
+            --compartment-id ${{ secrets.OCI_COMPARTMENT_OCID }} \
+            --shape "VM.Standard.E2.1.Micro" \
+            --image-id "${{ secrets.OCI_IMAGE_ID_WINDOWS }}" \
+            --ssh-authorized-keys-file $HOME/.ssh/id_rsa.pub \
+            --display-name "gh-windows-vps" \
+            --wait-for-state RUNNING \
+            --query "data.id" | tr -d '"')
+          echo "VM_OCID=$VM_OCID" >> $GITHUB_ENV
 
-      - name: Start Tailscale
+      - name: Get Public IP
+        id: get_ip
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="vps-free-$env:GITHUB_RUN_ID"
+          IP=$(oci compute instance list-vnics --instance-id ${{ env.VM_OCID }} \
+               --query "data[0].'public-ip'" | tr -d '"')
+          echo "VPS_IP=$IP" >> $GITHUB_ENV
+          echo "VPS IP: $IP"
 
-          # Esperar IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
-          if (-not $tsIP) { Write-Error "Tailscale IP no asignada"; exit 1 }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $tsIP"
-
-      - name: Detect CPU & GPU
+      - name: Wait for WinRM
         run: |
-          Write-Host "=== Detectando CPU y GPU ==="
-          $cpu = Get-WmiObject Win32_Processor | Select-Object -ExpandProperty Name
-          Write-Host "CPU: $cpu"
-          $gpu = Get-WmiObject Win32_VideoController | Where-Object {$_.Name -like "*NVIDIA*"}
-          if ($gpu) {
-              Write-Host "GPU NVIDIA detectada: $($gpu.Name)"
-          } else {
-              Write-Host "No se detectó GPU NVIDIA"
-          }
+          for i in {1..30}; do
+            nc -zv ${{ env.VPS_IP }} 5985 && break
+            echo "Waiting for WinRM..."
+            sleep 10
+          done
 
-      - name: Show RDP Info
+      - name: Configure Windows VPS (RDP + Tailscale)
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ env.VPS_IP }}
+          username: Administrator
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            # --- Habilitar RDP ---
+            powershell -Command "
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force;
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force;
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force;
+              netsh advfirewall firewall delete rule name='RDP-Tailscale';
+              netsh advfirewall firewall add rule name='RDP-Tailscale' dir=in action=allow protocol=TCP localport=3389;
+              Restart-Service -Name TermService -Force
+            "
+
+            # --- Crear usuario administrador ---
+            powershell -Command "
+              Add-Type -AssemblyName System.Security;
+              $charSet = @{ Upper=[char[]](65..90); Lower=[char[]](97..122); Number=[char[]](48..57); Special=([char[]](33..47)+[char[]](58..64)+[char[]](91..96)+[char[]](123..126)) };
+              $rawPassword = @(); $rawPassword += $charSet.Upper | Get-Random -Count 4;
+              $rawPassword += $charSet.Lower | Get-Random -Count 4; $rawPassword += $charSet.Number | Get-Random -Count 4;
+              $rawPassword += $charSet.Special | Get-Random -Count 4;
+              $password = -join ($rawPassword | Sort-Object { Get-Random });
+              $securePass = ConvertTo-SecureString $password -AsPlainText -Force;
+              New-LocalUser -Name 'RDP' -Password $securePass -AccountNeverExpires;
+              Add-LocalGroupMember -Group 'Administrators' -Member 'RDP';
+              Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP';
+              echo '::add-mask::$password';
+              echo 'RDP_CREDS=User:RDP|Password:' + $password;
+            "
+
+            # --- Instalar Tailscale ---
+            powershell -Command "
+              $tsUrl='https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi';
+              $installerPath='$env:TEMP\tailscale.msi';
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath;
+              Start-Process msiexec.exe -ArgumentList '/i', \"`$installerPath`\", '/quiet','/norestart' -Wait;
+              Remove-Item $installerPath -Force;
+              & '$env:ProgramFiles\Tailscale\tailscale.exe' up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-win-vps-${GITHUB_RUN_ID};
+              $tsIP=& '$env:ProgramFiles\Tailscale\tailscale.exe' ip -4;
+              echo 'TAILSCALE_IP=' + $tsIP;
+            "
+
+      - name: Show Connection Info
         run: |
-          Write-Host "`n=== RDP LISTO ==="
-          Write-Host "Usuario: RDP"
-          Write-Host "Password: P@ssw0rd123!"
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "==================`n"
+          echo "RDP listo!"
+          echo "Conéctate usando Tailscale IP y credenciales enmascaradas en el job."
